@@ -52,6 +52,21 @@ KOLOM_JENIS = {"Sumut": 0, "Aceh": 5, "Riau": 10, "Sumbar": 15, "Kepri": 20}
 KOLOM_SKALA = {"Sumut": 0, "Aceh": 6, "Riau": 12, "Sumbar": 18, "Kepri": 24}
 BARIS_SEKTOR = {"Sumut": 2, "Aceh": 9, "Riau": 16, "Sumbar": 23, "Kepri": 30}
 
+# --- Perubahan YoY rasio Bank Umum (NPL Gross, NPL Net, LaR, LDR) ---------------
+# Baris rasio pada sheet "BU-Kinerja Umum" (0-based) — sama dengan _parse_umum.
+BU_BARIS_RASIO = {"NPL Gross": 6, "NPL Net": 7, "LaR": 8, "LDR": 9}
+BU_OFFSET_NILAI = 4     # kolom nilai posisi terkini (relatif terhadap KOLOM_UMUM)
+BU_OFFSET_YOY = 6       # kolom YoY (sama dengan kolom YoY Aset/DPK/Kredit)
+BU_LEBAR_BLOK = 8       # lebar blok satu provinsi
+# Cara membaca perubahan rasio bila kolom posisi tahun lalu tidak terdeteksi otomatis:
+#   "auto"     : teks "69 bps"/"0,69 pp"/"0,69%" dibaca sesuai satuannya; angka |x| ≥ 1 = bps,
+#                angka |x| < 1 = selisih dalam fraksi (0,0069 = 69 bps)
+#   "fraction" : sel berisi selisih dalam fraksi (0,0069 = 69 bps)
+#   "pp"       : sel berisi selisih dalam poin persen (0,69 = 69 bps)
+#   "bps"      : sel berisi selisih dalam basis poin (69 = 69 bps)
+#   "relative" : sel berisi pertumbuhan relatif rasio (cur/prev − 1); selisih dihitung balik
+BU_RASIO_YOY_MODE = "auto"
+
 # Pengenal nama provinsi pada header sheet (urutan penting: yang spesifik dulu)
 PROV_KEYS = [
     ("kepulauan riau", "Kepri"), ("kep. riau", "Kepri"), ("kepri", "Kepri"),
@@ -224,18 +239,79 @@ def _header_rows(raw: pd.DataFrame, matcher, min_hit: int = 3) -> list[int]:
 
 
 # --------------------- Bank Umum ---------------------
+def _bu_prev_col(raw: pd.DataFrame, k: int):
+    """Kolom posisi tahun lalu pada blok provinsi Bank Umum, dideteksi dari baris header
+    bertanggal (baris 0–3). Dipakai hanya bila kolom terkini hasil deteksi = kolom nilai."""
+    for r in range(0, min(4, raw.shape[0])):
+        dcols = [(c, pd.Timestamp(_raw(raw, r, c))) for c in range(k, k + BU_LEBAR_BLOK)
+                 if _is_date(_raw(raw, r, c))]
+        if len(dcols) >= 2:
+            cur, c_prev, _ = _pick_periods(dcols)
+            if cur is not None and cur[0] == k + BU_OFFSET_NILAI and c_prev is not None:
+                return c_prev
+    return None
+
+
+def _ratio_change(v, cur: float, mode: str = BU_RASIO_YOY_MODE) -> float:
+    """Isi sel 'YoY' baris rasio → selisih YoY dalam fraksi (0,0069 = +69 bps)."""
+    if v is None or (not isinstance(v, str) and pd.isna(v)):
+        return np.nan
+    if isinstance(v, str):
+        t = v.strip().lower().replace("−", "-").replace(" ", "")
+        m = re.search(r"[-+]?\d[\d.,]*", t)
+        if m is None:
+            return np.nan
+        g = m.group().rstrip(".,")
+        g = g.replace(".", "").replace(",", ".") if ("," in g and "." in g) else g.replace(",", ".")
+        try:
+            x = float(g)
+        except ValueError:
+            return np.nan
+        if "bp" in t:
+            return x / 10000
+        if "pp" in t or "poin" in t or "%" in t:
+            return x / 100
+        v = x
+    x = _num(v)
+    if pd.isna(x):
+        return np.nan
+    if mode == "fraction":
+        return x
+    if mode == "pp":
+        return x / 100
+    if mode == "bps":
+        return x / 10000
+    if mode == "relative":
+        return cur - cur / (1 + x) if (pd.notna(cur) and x > -1) else np.nan
+    return x / 10000 if abs(x) >= 1 else x       # "auto"
+
+
 def _parse_umum(raw: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for prov in PROVINSI:
         k = KOLOM_UMUM[prov]
-        rows.append({
+        rec = {
             "Provinsi": prov,
             "Aset": _cell(raw, 3, k + 4), "YoY Aset": _cell(raw, 3, k + 6),
             "DPK": _cell(raw, 4, k + 4), "YoY DPK": _cell(raw, 4, k + 6),
             "Kredit": _cell(raw, 5, k + 4), "YoY Kredit": _cell(raw, 5, k + 6),
             "NPL Gross": _cell(raw, 6, k + 4), "NPL Net": _cell(raw, 7, k + 4),
             "LaR": _cell(raw, 8, k + 4), "LDR": _cell(raw, 9, k + 4),
-        })
+        }
+        # Perubahan YoY rasio (fraksi; ×10.000 = bps). Prioritas: selisih langsung terhadap
+        # kolom posisi tahun lalu (bila terdeteksi), lalu isi kolom YoY baris rasio.
+        c_prev = _bu_prev_col(raw, k)
+        for key, r in BU_BARIS_RASIO.items():
+            cur = rec[key]
+            delta = np.nan
+            if c_prev is not None:
+                prev = _cell(raw, r, c_prev)
+                if pd.notna(cur) and pd.notna(prev):
+                    delta = cur - prev
+            if pd.isna(delta):
+                delta = _ratio_change(_raw(raw, r, k + BU_OFFSET_YOY), cur)
+            rec[f"Δ {key}"] = delta
+        rows.append(rec)
     return pd.DataFrame(rows)
 
 
